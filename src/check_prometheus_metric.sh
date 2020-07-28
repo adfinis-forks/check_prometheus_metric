@@ -192,11 +192,11 @@ function check_prometheus_server {
     fi
 
     # Check if the prometheus endpoint exists, and can be queried
-    curl -s ${PROMETHEUS_SERVER}/api/v1/query?query=cafebabe | jq -e '.status == "success"' 1>/dev/null 2>/dev/null
+    curl -s "${CURL_OPTS[@]}" ${PROMETHEUS_SERVER}/api/v1/query?query=cafebabe | jq -e '.status == "success"' 1>/dev/null 2>/dev/null
     PROMETHEUS_OK=$?
     if [ "${PROMETHEUS_OK}" -ne 0 ]; then
         NAGIOS_STATUS=UNKNOWN
-        NAGIOS_SHORT_TEXT="unable to query proemtheus endpoint!"
+        NAGIOS_SHORT_TEXT="unable to query prometheus endpoint!"
         exit
     fi
 }
@@ -236,6 +236,21 @@ function get_prometheus_vector_value {
   _RESULT=$(echo $1 | jq -r '.[0].value?')
   printf '%s' "${_RESULT}"
 
+}
+
+function get_prometheus_vector_values {
+
+  local _RESULT
+
+  local _LENGTH=$(echo $1 | jq -r '. | length')
+  local _I=0
+
+  while [ "${_I}" -lt "${_LENGTH}" ]
+  do
+    _RESULT=$(echo $1 | jq -rc ".[${_I}].value?")
+    printf '%s\n' "${_RESULT}"
+    _I=$(expr 1 + ${_I})
+  done
 }
 
 function get_prometheus_vector_metric {
@@ -279,42 +294,55 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
     # extract the metric value from the raw prometheus result
     if [[ "${PROMETHEUS_QUERY_TYPE}" == "scalar" ]]; then
-        PROMETHEUS_RESULT=$( get_prometheus_scalar_result "$PROMETHEUS_RAW_RESULT" )
+        PROMETHEUS_VALUES="$PROMETHEUS_RAW_RESULT"
         PROMETHEUS_METRIC=UNKNOWN
     else
-        PROMETHEUS_VALUE=$( get_prometheus_vector_value "$PROMETHEUS_RAW_RESULT" )
-        PROMETHEUS_RESULT=$( get_prometheus_scalar_result "$PROMETHEUS_VALUE" )
-        PROMETHEUS_METRIC=$( get_prometheus_vector_metric "$PROMETHEUS_RAW_RESULT" ) 
+        PROMETHEUS_VALUES=$( get_prometheus_vector_values "$PROMETHEUS_RAW_RESULT" )
+        PROMETHEUS_METRIC=$( get_prometheus_vector_metric "$PROMETHEUS_RAW_RESULT" )
     fi
 
-    # check the value
-    if is_float ${PROMETHEUS_RESULT}; then
-      JSON=$(echo "${LEVEL_JSON} {\"value\": ${PROMETHEUS_RESULT}}" | jq -s add)
-      # Evaluate critical and warning levels
-      echo "${JSON}" | jq -e ".critical_low <= .value and .value <= .critical_high" >/dev/null
-      IS_CRITICAL=$?
-      echo "${JSON}" | jq -e ".warning_low <= .value and .value <= .warning_high" >/dev/null
-      IS_WARNING=$?
+    NAGIOS_LONG_TEXT=""
 
-      if [ ${IS_CRITICAL} -ne ${CRITICAL_INVERTED} ]; then
-        NAGIOS_STATUS=CRITICAL
+    _COUNTER_WARNING=0
+    for PROMETHEUS_VALUE in $PROMETHEUS_VALUES; do
+      PROMETHEUS_RESULT=$( get_prometheus_scalar_result "$PROMETHEUS_VALUE" )
+      # check the value
+      if is_float "${PROMETHEUS_RESULT}"; then
+        JSON=$(echo "${LEVEL_JSON} {\"value\": ${PROMETHEUS_RESULT}}" | jq -s add)
+        # Evaluate critical and warning levels
+        echo "${JSON}" | jq -e ".critical_low <= .value and .value <= .critical_high" >/dev/null
+        IS_CRITICAL=$?
+        echo "${JSON}" | jq -e ".warning_low <= .value and .value <= .warning_high" >/dev/null
+        IS_WARNING=$?
+
         NAGIOS_SHORT_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
-      elif [ ${IS_WARNING} -ne ${WARNING_INVERTED} ]; then
-        NAGIOS_STATUS=WARNING
-        NAGIOS_SHORT_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
+        if [ ${IS_CRITICAL} -ne ${CRITICAL_INVERTED} ]; then
+          NAGIOS_STATUS=CRITICAL
+          NAGIOS_LONG_TEXT="${PROMETHEUS_METRIC}"
+          break
+        elif [ ${IS_WARNING} -ne ${WARNING_INVERTED} ]; then
+          NAGIOS_STATUS=WARNING
+          NAGIOS_LONG_TEXT=$(printf '%s\n%s' "${NAGIOS_LONG_TEXT}" "${PROMETHEUS_METRIC}")
+          _COUNTER_WARNING=$(expr 1 + ${_COUNTER_WARNING})
+        else
+          NAGIOS_STATUS=OK
+        fi
       else
-        NAGIOS_STATUS=OK
-        NAGIOS_SHORT_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
+        if [[ "${NAN_OK}" = "true" && "${PROMETHEUS_RESULT}" = "NaN" ]]; then
+          NAGIOS_STATUS=OK
+          NAGIOS_SHORT_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
+        else
+          NAGIOS_SHORT_TEXT="unable to parse prometheus response"
+          NAGIOS_LONG_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
+          break
+        fi
       fi
-    else
-      if [[ "${NAN_OK}" = "true" && "${PROMETHEUS_RESULT}" = "NaN" ]]; then
-        NAGIOS_STATUS=OK
-        NAGIOS_SHORT_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
-      else    
-        NAGIOS_SHORT_TEXT="unable to parse prometheus response"
-        NAGIOS_LONG_TEXT="${METRIC_NAME} is ${PROMETHEUS_RESULT}"
-      fi
+    done
+
+    if [ "${NAGIO_STATUS}" != "CRITICAL" -a "${_COUNTER_WARNING}" -gt 0 ]; then
+      NAGIOS_STATUS=WARNING
     fi
+
     if [[ "${NAGIOS_INFO}" = "true" ]]; then
         NAGIOS_SHORT_TEXT="${NAGIOS_SHORT_TEXT}: ${PROMETHEUS_METRIC}"
     fi
